@@ -166,14 +166,31 @@ export async function getAllRooms(): Promise<RoomData[]> {
   }
 }
 
-// File upload helper (in production, use a proper file storage service)
-export function uploadFile(file: File): Promise<string> {
-  return new Promise((resolve) => {
-    // For demo purposes, create a blob URL
-    // In production, upload to a service like Vercel Blob, AWS S3, etc.
-    const url = URL.createObjectURL(file)
-    resolve(url)
-  })
+// File upload helper using Vercel Blob
+export async function uploadFile(file: File): Promise<string> {
+  try {
+    console.log("[room-storage] Uploading file to Vercel Blob:", file.name)
+    const response = await fetch(`/api/upload?filename=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      body: file,
+      headers: {
+        "Content-Type": file.type,
+      },
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json()
+      console.error("[room-storage] Failed to upload file to Vercel Blob:", errorData)
+      throw new Error(errorData.details || "File upload failed")
+    }
+
+    const blob = await response.json()
+    console.log("[room-storage] File uploaded to Vercel Blob successfully:", blob.url)
+    return blob.url
+  } catch (error) {
+    console.error("[room-storage] Error in uploadFile:", error)
+    throw error
+  }
 }
 
 // These are no longer needed as database handles cleanup and initialization

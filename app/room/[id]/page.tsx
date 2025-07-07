@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -32,6 +32,8 @@ import {
   Trash2,
   Crown,
   RefreshCw,
+  Wifi,
+  WifiOff,
 } from "lucide-react"
 import { useParams, useRouter } from "next/navigation"
 import { useToast } from "@/hooks/use-toast"
@@ -45,6 +47,7 @@ import {
   type RoomData,
   type Message,
 } from "@/lib/room-storage"
+import { socketManager, type SocketMessage } from "@/lib/socket"
 
 export default function RoomPage() {
   const params = useParams()
@@ -58,37 +61,115 @@ export default function RoomPage() {
   const [isCreator, setIsCreator] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [isJoining, setIsJoining] = useState(false)
-  const [isSending, setIsSending] = useState(false)
+  const [isConnected, setIsConnected] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [roomNotFound, setRoomNotFound] = useState(false)
 
-  const loadRoom = async () => {
-    setIsLoading(true)
-    const roomId = params.id as string
-    const room = await getRoom(roomId)
+  const loadRoom = useCallback(
+    async (showLoading = true) => {
+      if (showLoading) setIsLoading(true)
+      const roomId = params.id as string
+      const room = await getRoom(roomId)
 
-    if (!room) {
-      setRoomNotFound(true)
+      if (!room) {
+        setRoomNotFound(true)
+        setIsLoading(false)
+        return
+      }
+
+      setRoomData(room)
       setIsLoading(false)
-      return
-    }
 
-    setRoomData(room)
-    setIsLoading(false)
+      // Check if user already joined
+      const storedUserName = localStorage.getItem(`user_${roomId}`)
+      if (storedUserName && room.members.includes(storedUserName)) {
+        setUserName(storedUserName)
+        setHasJoined(true)
+        setIsCreator(storedUserName === room.creator)
+      }
+    },
+    [params.id],
+  )
 
-    // Check if user already joined
-    const storedUserName = localStorage.getItem(`user_${roomId}`)
-    if (storedUserName && room.members.includes(storedUserName)) {
-      setUserName(storedUserName)
-      setHasJoined(true)
-      setIsCreator(storedUserName === room.creator)
+  // Handle incoming socket messages
+  const handleSocketMessage = useCallback(
+    (socketMessage: SocketMessage) => {
+      console.log("[Socket] Received message:", socketMessage)
+
+      switch (socketMessage.type) {
+        case "message":
+          setRoomData((prevRoom) => {
+            if (!prevRoom) return null
+            // Check if message already exists to avoid duplicates
+            const messageExists = prevRoom.messages.some((msg) => msg.id === socketMessage.data.id)
+            if (messageExists) return prevRoom
+
+            return {
+              ...prevRoom,
+              messages: [...prevRoom.messages, socketMessage.data],
+            }
+          })
+          break
+
+        case "member_join":
+          setRoomData((prevRoom) => {
+            if (!prevRoom) return null
+            const memberExists = prevRoom.members.includes(socketMessage.data.userName)
+            if (memberExists) return prevRoom
+
+            return {
+              ...prevRoom,
+              members: [...prevRoom.members, socketMessage.data.userName],
+            }
+          })
+          toast({
+            title: "Member Joined",
+            description: `${socketMessage.data.userName} joined the room`,
+          })
+          break
+
+        case "member_leave":
+          setRoomData((prevRoom) => {
+            if (!prevRoom) return null
+            return {
+              ...prevRoom,
+              members: prevRoom.members.filter((member) => member !== socketMessage.data.userName),
+            }
+          })
+          toast({
+            title: "Member Left",
+            description: `${socketMessage.data.userName} left the room`,
+          })
+          break
+      }
+    },
+    [toast],
+  )
+
+  // Initialize socket connection when user joins
+  useEffect(() => {
+    if (hasJoined && roomData && userName) {
+      const roomId = params.id as string
+
+      // Connect to socket
+      socketManager.connect(roomId, userName)
+      setIsConnected(socketManager.isConnected())
+
+      // Listen for messages
+      socketManager.onMessage(handleSocketMessage)
+
+      return () => {
+        socketManager.removeMessageHandler(handleSocketMessage)
+        socketManager.disconnect()
+        setIsConnected(false)
+      }
     }
-  }
+  }, [hasJoined, roomData, userName, params.id, handleSocketMessage])
 
   useEffect(() => {
     loadRoom()
-  }, [params.id])
+  }, [loadRoom])
 
   useEffect(() => {
     if (roomData) {
@@ -119,16 +200,16 @@ export default function RoomPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [roomData?.messages])
 
-  // Auto-refresh room data every 5 seconds
+  // Reduced polling - only for backup sync, not primary updates
   useEffect(() => {
     if (hasJoined && roomData) {
       const interval = setInterval(() => {
-        loadRoom()
-      }, 5000) // Poll every 5 seconds
+        loadRoom(false) // Load without showing loading state
+      }, 60000) // Poll every 60 seconds instead of 5 seconds
 
       return () => clearInterval(interval)
     }
-  }, [hasJoined, roomData])
+  }, [hasJoined, roomData, loadRoom])
 
   const joinRoom = async () => {
     if (!userName.trim() || !roomData || isJoining) {
@@ -170,13 +251,22 @@ export default function RoomPage() {
         setHasJoined(true)
         setIsCreator(userName === roomData.creator)
 
-        // Refresh room data to get updated members list
-        await loadRoom()
+        // Update local state immediately
+        setRoomData((prev) => (prev ? { ...prev, members: updatedMembers } : null))
 
         toast({
           title: "Joined Room",
           description: `Welcome to ${roomData.name}!`,
         })
+
+        // Broadcast join event via socket
+        const joinMessage: SocketMessage = {
+          type: "member_join",
+          data: { userName },
+          roomId: roomData.id,
+          timestamp: Date.now(),
+        }
+        socketManager.sendMessage(joinMessage)
       } else {
         toast({
           title: "Error",
@@ -197,26 +287,48 @@ export default function RoomPage() {
   }
 
   const sendMessage = async () => {
-    if (!message.trim() || !roomData || !userName || isSending) return
+    if (!message.trim() || !roomData || !userName) return
 
-    setIsSending(true)
+    const newMessage: Message = {
+      id: Math.random().toString(36).substring(2, 15),
+      type: "text",
+      content: message,
+      sender: userName,
+      timestamp: Date.now(),
+    }
+
+    // Immediately update UI (optimistic update)
+    setRoomData((prevRoom) => {
+      if (!prevRoom) return null
+      return {
+        ...prevRoom,
+        messages: [...prevRoom.messages, newMessage],
+      }
+    })
+    setMessage("") // Clear input immediately
 
     try {
-      const newMessage: Message = {
-        id: Math.random().toString(36).substring(2, 15),
-        type: "text",
-        content: message,
-        sender: userName,
-        timestamp: Date.now(),
-      }
-
+      // Send to database
       const success = await addMessage(roomData.id, newMessage)
 
       if (success) {
-        setMessage("")
-        // Refresh room data to get the new message
-        await loadRoom()
+        // Broadcast to other users via socket
+        const socketMessage: SocketMessage = {
+          type: "message",
+          data: newMessage,
+          roomId: roomData.id,
+          timestamp: Date.now(),
+        }
+        socketManager.sendMessage(socketMessage)
       } else {
+        // Revert optimistic update on failure
+        setRoomData((prevRoom) => {
+          if (!prevRoom) return null
+          return {
+            ...prevRoom,
+            messages: prevRoom.messages.filter((msg) => msg.id !== newMessage.id),
+          }
+        })
         toast({
           title: "Error",
           description: "Failed to send message. Please try again.",
@@ -225,13 +337,19 @@ export default function RoomPage() {
       }
     } catch (error) {
       console.error("Error sending message:", error)
+      // Revert optimistic update on error
+      setRoomData((prevRoom) => {
+        if (!prevRoom) return null
+        return {
+          ...prevRoom,
+          messages: prevRoom.messages.filter((msg) => msg.id !== newMessage.id),
+        }
+      })
       toast({
         title: "Error",
         description: "An unexpected error occurred while sending the message.",
         variant: "destructive",
       })
-    } finally {
-      setIsSending(false)
     }
   }
 
@@ -239,13 +357,36 @@ export default function RoomPage() {
     const file = event.target.files?.[0]
     if (!file || !roomData || !userName) return
 
+    const tempMessageId = Math.random().toString(36).substring(2, 15)
+
     try {
       toast({
         title: "Uploading File",
         description: "Please wait while your file is being uploaded...",
       })
 
-      const fileUrl = await uploadFile(file) // This is a client-side blob URL for demo
+      // Optimistically create a placeholder message
+      const tempFileMessage: Message = {
+        id: tempMessageId,
+        type: "file",
+        content: `Uploading: ${file.name}...`,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type,
+        fileUrl: "", // Temporary empty URL
+        sender: userName,
+        timestamp: Date.now(),
+      }
+
+      setRoomData((prevRoom) => {
+        if (!prevRoom) return null
+        return {
+          ...prevRoom,
+          messages: [...prevRoom.messages, tempFileMessage],
+        }
+      })
+
+      const fileUrl = await uploadFile(file)
 
       const fileMessage: Message = {
         id: Math.random().toString(36).substring(2, 15),
@@ -262,13 +403,37 @@ export default function RoomPage() {
       const success = await addMessage(roomData.id, fileMessage)
 
       if (success) {
-        // Refresh room data to get the new message
-        await loadRoom()
+        // Replace temp message with final message
+        setRoomData((prevRoom) => {
+          if (!prevRoom) return null
+          return {
+            ...prevRoom,
+            messages: prevRoom.messages.map((msg) => (msg.id === tempMessageId ? fileMessage : msg)),
+          }
+        })
+
+        // Broadcast to other users via socket
+        const socketMessage: SocketMessage = {
+          type: "message",
+          data: fileMessage,
+          roomId: roomData.id,
+          timestamp: Date.now(),
+        }
+        socketManager.sendMessage(socketMessage)
+
         toast({
           title: "File Shared",
           description: `${file.name} has been shared successfully!`,
         })
       } else {
+        // Remove temp message on failure
+        setRoomData((prevRoom) => {
+          if (!prevRoom) return null
+          return {
+            ...prevRoom,
+            messages: prevRoom.messages.filter((msg) => msg.id !== tempMessageId),
+          }
+        })
         toast({
           title: "Error",
           description: "Failed to share file. Please try again.",
@@ -277,6 +442,14 @@ export default function RoomPage() {
       }
     } catch (error) {
       console.error("Error handling file upload:", error)
+      // Remove temp message on error
+      setRoomData((prevRoom) => {
+        if (!prevRoom) return null
+        return {
+          ...prevRoom,
+          messages: prevRoom.messages.filter((msg) => msg.id !== tempMessageId),
+        }
+      })
       toast({
         title: "Error",
         description: "Failed to upload file. Please try again.",
@@ -359,7 +532,6 @@ export default function RoomPage() {
   }
 
   if (!roomData) {
-    // This case should ideally not be reached if roomNotFound is handled
     return (
       <div className="flex items-center justify-center min-h-screen text-lg font-medium">Room data not loaded.</div>
     )
@@ -420,10 +592,20 @@ export default function RoomPage() {
                 <Crown className="w-4 h-4" />
                 {roomData.creator}
               </span>
+              <span className="flex items-center gap-1">
+                {isConnected ? (
+                  <Wifi className="w-4 h-4 text-green-600" />
+                ) : (
+                  <WifiOff className="w-4 h-4 text-red-600" />
+                )}
+                <span className={isConnected ? "text-green-600" : "text-red-600"}>
+                  {isConnected ? "Live" : "Offline"}
+                </span>
+              </span>
             </div>
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={loadRoom} disabled={isLoading}>
+            <Button variant="outline" size="sm" onClick={() => loadRoom()} disabled={isLoading}>
               <RefreshCw className="w-4 h-4" />
             </Button>
             <Button variant="outline" onClick={copyRoomLink}>
@@ -519,6 +701,7 @@ export default function RoomPage() {
                               size="sm"
                               variant="outline"
                               onClick={() => downloadFile(msg.fileUrl || "", msg.fileName || "download")}
+                              disabled={!msg.fileUrl}
                             >
                               <Download className="w-3 h-3 mr-1" />
                               Download
@@ -540,13 +723,12 @@ export default function RoomPage() {
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && sendMessage()}
                   className="flex-1"
-                  disabled={isSending}
                 />
                 <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
                 <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
                   <Paperclip className="w-4 h-4" />
                 </Button>
-                <Button onClick={sendMessage} disabled={!message.trim() || isSending}>
+                <Button onClick={sendMessage} disabled={!message.trim()}>
                   <Send className="w-4 h-4" />
                 </Button>
               </div>
